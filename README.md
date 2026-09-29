@@ -58,7 +58,7 @@ All configurations use:
 Download the official Fedora ISO for your edition:
 
 - **[Fedora Workstation](https://getfedora.org/workstation/download/)** - GNOME desktop experience
-- **[Fedora KDE Plasma](https://getfedora.org/spins/kde/download/)** - KDE Plasma desktop experience
+- **[Fedora KDE Plasma](https://getfedora.org/kde/download/)** - KDE Plasma desktop experience
 - **[Fedora Server](https://getfedora.org/server/download/)** - Headless / Cockpit-managed server
 
 Write the ISO to USB with [Fedora Media Writer](https://getfedora.org/mediawriter/) and boot in UEFI mode.
