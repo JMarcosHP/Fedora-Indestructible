@@ -256,13 +256,28 @@ sudo mv var var-tmp
 sudo btrfs su cre var
 sudo chattr +C var
 sudo cp -ar var-tmp/. var/
-# var-tmp can hold nested subvolumes (e.g. lib/portables);
-# delete them deepest-first, or var-tmp cannot be removed.
+
+# Nested subvolumes (e.g. lib/portables) were flattened by the copy;
+# rebuild each as a real subvolume, shallowest first.
+NESTED_LIST="$(sudo btrfs subvolume list -o /mnt/fedora/var-tmp | sed -n 's/.* path //p' | sed 's|^var-tmp/||')"
+if [[ -n "$NESTED_LIST" ]]; then
+    echo "$NESTED_LIST" | awk -F/ '{print NF, $0}' | sort -n | cut -d' ' -f2- \
+    | while IFS= read -r rel; do
+        sudo mv "/mnt/fedora/var/$rel" "/mnt/fedora/var/$rel.migrate-tmp"
+        sudo btrfs subvolume create "/mnt/fedora/var/$rel"
+        sudo chattr +C "/mnt/fedora/var/$rel"
+        sudo cp -ar "/mnt/fedora/var/$rel.migrate-tmp/." "/mnt/fedora/var/$rel/"
+        sudo rm -rf "/mnt/fedora/var/$rel.migrate-tmp"
+    done
+fi
+
+# Delete original nested subvolumes deepest-first, then var-tmp itself.
 sudo btrfs subvolume list -o /mnt/fedora/var-tmp | sed -n 's/.* path //p' \
     | awk -F/ '{print NF, $0}' | sort -rn | cut -d' ' -f2- \
     | while IFS= read -r child; do
         sudo btrfs subvolume delete "/mnt/fedora/$child"
     done
+
 sudo btrfs su del var-tmp
 VAR_ID="$(sudo btrfs subvolume show /mnt/fedora/var | awk '/Subvolume ID:/ {print $NF}')"
 sudo umount -l /var && sudo mount -o subvolid=$VAR_ID,noatime,nodiratime,space_cache=v2 $SYSTEM /var

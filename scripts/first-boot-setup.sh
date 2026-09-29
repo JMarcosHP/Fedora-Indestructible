@@ -50,8 +50,20 @@ mv var var-tmp
 btrfs subvolume create var
 chattr +C var
 cp -ar var-tmp/. var/
-# var-tmp can hold nested subvolumes (e.g. lib/portables);
-# delete them deepest-first, or var-tmp cannot be removed.
+# Nested subvolumes (e.g. lib/portables) were flattened by the copy;
+# rebuild each as a real subvolume, shallowest first.
+NESTED_LIST="$(btrfs subvolume list -o /mnt/fedora/var-tmp | sed -n 's/.* path //p' | sed 's|^var-tmp/||')"
+if [[ -n "$NESTED_LIST" ]]; then
+    echo "$NESTED_LIST" | awk -F/ '{print NF, $0}' | sort -n | cut -d' ' -f2- |
+    while IFS= read -r rel; do
+        mv "/mnt/fedora/var/$rel" "/mnt/fedora/var/$rel.migrate-tmp"
+        btrfs subvolume create "/mnt/fedora/var/$rel"
+        chattr +C "/mnt/fedora/var/$rel"
+        cp -ar "/mnt/fedora/var/$rel.migrate-tmp/." "/mnt/fedora/var/$rel/"
+        rm -rf "/mnt/fedora/var/$rel.migrate-tmp"
+    done
+fi
+# Delete original nested subvolumes deepest-first, then var-tmp itself.
 btrfs subvolume list -o /mnt/fedora/var-tmp | sed -n 's/.* path //p' \
     | awk -F/ '{print NF, $0}' | sort -rn | cut -d' ' -f2- \
     | while IFS= read -r child; do
