@@ -48,7 +48,14 @@ mv var var-tmp
 btrfs subvolume create var
 chattr +C var
 cp -ar var-tmp/. var/
-btrfs subvolume delete var-tmp
+# var-tmp can hold nested subvolumes (e.g. lib/portables);
+# delete them deepest-first, or var-tmp cannot be removed.
+btrfs subvolume list -o /mnt/fedora/var-tmp | sed -n 's/.* path //p' \
+    | awk -F/ '{print NF, $0}' | sort -rn | cut -d' ' -f2- \
+    | while IFS= read -r child; do
+        btrfs subvolume delete "/mnt/fedora/$child"
+    done
+btrfs subvolume delete /mnt/fedora/var-tmp
 VAR_ID="$(btrfs subvolume show /mnt/fedora/var | awk '/Subvolume ID:/ {print $NF}')"
 umount -l /var && mount -o "subvolid=$VAR_ID",noatime,nodiratime,space_cache=v2 "$SYSTEM" /var
 # Expect the C flag below.

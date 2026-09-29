@@ -209,6 +209,13 @@ sudo mv var var-tmp
 sudo btrfs su cre var
 sudo chattr +C var
 sudo cp -ar var-tmp/. var/
+# var-tmp can hold nested subvolumes (e.g. lib/portables);
+# delete them deepest-first, or var-tmp cannot be removed.
+sudo btrfs subvolume list -o /mnt/fedora/var-tmp | sed -n 's/.* path //p' \
+    | awk -F/ '{print NF, $0}' | sort -rn | cut -d' ' -f2- \
+    | while IFS= read -r child; do
+        sudo btrfs subvolume delete "/mnt/fedora/$child"
+    done
 sudo btrfs su del var-tmp
 VAR_ID="$(sudo btrfs subvolume show /mnt/fedora/var | awk '/Subvolume ID:/ {print $NF}')"
 sudo umount -l /var && sudo mount -o subvolid=$VAR_ID,noatime,nodiratime,space_cache=v2 $SYSTEM /var
