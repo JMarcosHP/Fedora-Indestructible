@@ -1,0 +1,602 @@
+#!/usr/bin/env bash
+#
+# system-rollback - Manual btrfs rollback from a snapper snapshot.
+#
+# Why this exists:
+#   `snapper rollback` changes the default subvolume and reshapes the layout,
+#   which breaks GRUB on layouts where the default subvolume must stay subvolid=5.
+#   This script does the swap by hand and NEVER touches the default subvolume.
+#
+# Layout it expects (snapper's .snapshots is a CHILD subvolume of its target):
+#   root  -> /            (with root/.snapshots as a nested subvolume)
+#   home  -> /home        (optionally with home/.snapshots)
+#   ...
+#
+# How it works:
+#   1. Mount the btrfs top-level (subvolid=5) on a temporary directory.
+#   2. Locate the snapshot: <target>/.snapshots/<ID>/snapshot.
+#      The TARGET is derived from the snapshot path itself, so it is correct
+#      even when the system was booted from that very snapshot.
+#   3. Record every child subvolume nested inside the target (e.g. .snapshots).
+#   4. Rename the target to <target>_backup_<timestamp>.
+#   5. Create a NEW writable snapshot of the chosen snapshot in place of the target.
+#   6. Move each child subvolume from the backup into the new target.
+#   7. Optionally delete the backup subvolume (asked at the end).
+#
+# Usage:
+#   sudo system-rollback [-c CONFIG] [-n] [-y] [-h] <SNAPSHOT_ID>  Roll back
+#   sudo system-rollback list                                      List backups
+#   sudo system-rollback clean [-y] [all | N [N-M ...]]            Delete backups
+#
+#   -c CONFIG   snapper config name (default: root)
+#   -n          dry-run: show what would be done, change nothing
+#   -y          skip confirmation prompts (clean: still never touches a backup in use)
+#   -h          show this help
+#
+# Backups are the subvolumes named <subvol>_backup_<UTC timestamp> that a
+# rollback leaves behind. `list` and `clean` look at the whole filesystem
+# that holds "/", regardless of the snapper config.
+#
+# Example:
+#   sudo system-rollback 45
+#   sudo system-rollback -c home 12
+#   sudo system-rollback list
+#   sudo system-rollback clean            # pick from a numbered list
+#   sudo system-rollback clean 1 3        # delete backups #1 and #3
+#   sudo system-rollback clean all        # delete every backup not in use
+
+set -Eeuo pipefail
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+readonly SCRIPT_NAME="$(basename "$0")"
+readonly TOP_MNT="/run/${SCRIPT_NAME}.top"     # Temporary mountpoint for subvolid=5
+readonly TIMESTAMP="$(date -u +%Y%m%dT%H%M%S)" # Used to name the backup subvolume
+readonly SNAPSHOTS_DIR=".snapshots"            # Snapper's snapshot directory name
+
+CONFIG="root"     # Snapper config name
+DRY_RUN=0         # 1 = do not change anything
+ASSUME_YES=0      # 1 = skip confirmation prompt
+SNAP_ID=""        # Snapshot number given by the user
+
+MOUNTPOINT=""     # Mountpoint of the snapper config (e.g. "/", "/srv")
+TARGET_DEV=""     # Block device of the btrfs filesystem
+TARGET_UUID=""    # Filesystem UUID (used to mount the top-level reliably)
+TARGET_NAME=""    # Top-level path of the subvolume being replaced (e.g. "root")
+BACKUP_NAME=""    # Name given to the replaced subvolume
+SNAP_REL=""       # Snapshot path relative to the top-level
+CHILDREN=()       # Child subvolumes of the target (relative to the top-level)
+MIGRATED=()       # Children already moved into the new target (undo needs this)
+
+DIED=0            # 1 once die() reported the error itself
+MODE="rollback"   # rollback | list | clean
+SELECTION=()      # Tokens given to `clean` (numbers, ranges or "all")
+BACKUPS=()        # Backup subvolume names found in the top-level
+BACKUP_IDS=()     # Subvolume ID of each entry in BACKUPS (same order)
+readonly BACKUP_RE='^(.+)_backup_[0-9]{8}T[0-9]{6}$'   # Names this script creates
+
+# State kept so the error handler knows what to undo
+TOP_MOUNTED=0     # 1 once the top-level is mounted
+RENAMED=0         # 1 once the target was renamed to the backup name
+SNAPSHOT_MADE=0   # 1 once the new target subvolume was created
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+info() { printf '=> %s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; DIED=1; exit 1; }
+
+# Run a command, or only print it when in dry-run mode
+run() {
+    if (( DRY_RUN )); then
+        printf '[dry-run] %s\n' "$*"
+    else
+        "$@"
+    fi
+}
+
+usage() {
+    # Print the header comment block, without the leading "# "
+    sed -n '2,/^set -E/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
+}
+
+# ---------------------------------------------------------------------------
+# Cleanup / error handling
+# ---------------------------------------------------------------------------
+#
+# On failure: undo as much as possible so a failed run does not need manual
+# recovery. Three cases, in the order a rollback can fail:
+#   1. Renamed the target but never created the new snapshot -> rename back.
+#   2. Created the new snapshot but a later step (child migration) failed ->
+#      move back any children already migrated, delete the new snapshot, then
+#      rename the backup back to the original name. This is exactly the
+#      "stuck with root_backup_..., no root" state that used to need manual
+#      recovery.
+#   3. Failure has nothing to do with the swap (e.g. before renaming anything,
+#      or after everything succeeded) -> nothing to undo.
+on_exit() {
+    local rc=$?
+
+    if (( rc != 0 )); then
+        # die() already printed its own message; only report unexpected failures
+        (( DIED )) || warn "Failed (exit code $rc)."
+
+        if (( TOP_MOUNTED )) && (( RENAMED )); then
+            if (( SNAPSHOT_MADE )); then
+                warn "Rolling back the failed swap: undoing child migration and removing the new '$TARGET_NAME'..."
+
+                local child rel_in_target
+                for child in "${MIGRATED[@]}"; do
+                    rel_in_target="${child#"$TARGET_NAME"/}"
+                    if [[ -e "$TOP_MNT/$child" ]]; then
+                        mv "$TOP_MNT/$child" "$TOP_MNT/$BACKUP_NAME/$rel_in_target" 2>/dev/null \
+                            || warn "MANUAL FIX NEEDED: move '$child' back into '$BACKUP_NAME/$rel_in_target'."
+                    fi
+                done
+
+                if [[ -e "$TOP_MNT/$TARGET_NAME" ]]; then
+                    btrfs subvolume delete --recursive "$TOP_MNT/$TARGET_NAME" >/dev/null 2>&1 \
+                        || warn "MANUAL FIX NEEDED: delete '$TARGET_NAME' (the incomplete snapshot) manually."
+                fi
+                if [[ ! -e "$TOP_MNT/$TARGET_NAME" && -d "$TOP_MNT/$BACKUP_NAME" ]]; then
+                    mv "$TOP_MNT/$BACKUP_NAME" "$TOP_MNT/$TARGET_NAME" \
+                        && warn "Reverted: '$TARGET_NAME' is back to how it was before this run." \
+                        || warn "MANUAL FIX NEEDED: rename '$BACKUP_NAME' back to '$TARGET_NAME'."
+                fi
+            elif [[ ! -e "$TOP_MNT/$TARGET_NAME" && -d "$TOP_MNT/$BACKUP_NAME" ]]; then
+                warn "Reverting: restoring '$BACKUP_NAME' -> '$TARGET_NAME'"
+                mv "$TOP_MNT/$BACKUP_NAME" "$TOP_MNT/$TARGET_NAME" \
+                    || warn "MANUAL FIX NEEDED: rename '$BACKUP_NAME' back to '$TARGET_NAME' in the btrfs top-level."
+            fi
+        fi
+    fi
+
+    # Unmount the temporary top-level mount if it is still mounted
+    if (( TOP_MOUNTED )); then
+        cd / || true
+        umount "$TOP_MNT" 2>/dev/null || warn "Could not unmount $TOP_MNT"
+        rmdir "$TOP_MNT" 2>/dev/null || true
+        TOP_MOUNTED=0
+    fi
+}
+
+trap on_exit EXIT
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+parse_args() {
+    # A leading word selects a subcommand; otherwise this is a rollback
+    case "${1:-}" in
+        list|clean) MODE="$1"; shift ;;
+    esac
+
+    local opt
+    while getopts ":c:nyh" opt; do
+        case "$opt" in
+            c) CONFIG="$OPTARG" ;;
+            n) DRY_RUN=1 ;;
+            y) ASSUME_YES=1 ;;
+            h) usage; exit 0 ;;
+            :) die "Option -$OPTARG requires an argument." ;;
+            *) die "Unknown option: -$OPTARG (use -h for help)." ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
+    case "$MODE" in
+        list)
+            [[ $# -eq 0 ]] || die "'list' takes no arguments."
+            ;;
+        clean)
+            SELECTION=("$@")   # Empty means "ask interactively"
+            ;;
+        rollback)
+            [[ $# -eq 1 ]] || { usage; exit 1; }
+            SNAP_ID="$1"
+            [[ "$SNAP_ID" =~ ^[0-9]+$ ]] || die "Snapshot ID must be a number, got '$SNAP_ID'."
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Pre-flight checks
+# ---------------------------------------------------------------------------
+check_requirements() {
+    (( EUID == 0 )) || die "Run as root (use sudo)."
+
+    local cmd
+    for cmd in btrfs findmnt mount umount awk sed; do
+        command -v "$cmd" >/dev/null 2>&1 || die "Required command not found: $cmd"
+    done
+
+    # Only a rollback needs a snapper config; list/clean work on the whole filesystem
+    if [[ "$MODE" == "rollback" ]]; then
+        [[ -f "/etc/snapper/configs/$CONFIG" ]] \
+            || die "Snapper config '$CONFIG' not found (see /etc/snapper/configs/)."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Discovery
+# ---------------------------------------------------------------------------
+
+# Read the SUBVOLUME value from the snapper config file.
+# The file is plain KEY="value" text, which is stable across snapper versions.
+get_config_mountpoint() {
+    local file="/etc/snapper/configs/$CONFIG"
+    [[ -r "$file" ]] || die "Cannot read snapper config file: $file"
+
+    # Match SUBVOLUME="/path" and print only the value
+    sed -n 's/^SUBVOLUME="\(.*\)"[[:space:]]*$/\1/p' "$file" | head -n1
+}
+
+# Find the btrfs device and filesystem UUID that hold the config's mountpoint
+resolve_device() {
+    local mountpoint="$1"
+
+    [[ "$(findmnt -n -o FSTYPE --target "$mountpoint")" == "btrfs" ]] \
+        || die "'$mountpoint' is not on a btrfs filesystem."
+
+    # SOURCE may look like "/dev/vda3[/root]"; strip the bracketed subvolume part
+    TARGET_DEV="$(findmnt -n -o SOURCE --target "$mountpoint" | sed 's/\[.*\]$//')"
+    TARGET_UUID="$(findmnt -n -o UUID --target "$mountpoint")"
+
+    [[ -n "$TARGET_DEV" && -n "$TARGET_UUID" ]] \
+        || die "Could not detect the btrfs device for '$mountpoint'."
+}
+
+# Locate the snapshot in the mounted top-level and derive the TARGET from its path.
+# Snapper stores snapshots as <target>/.snapshots/<ID>/snapshot, so everything
+# before "/.snapshots/" is the subvolume that must be replaced. This does not
+# depend on what is mounted at "/".
+find_snapshot() {
+    local matches=() found rel
+
+    # Search only one level below the top-level and two levels for nested layouts
+    while IFS= read -r found; do
+        rel="${found#"$TOP_MNT"/}"
+        matches+=("$rel")
+    done < <(find "$TOP_MNT" -maxdepth 4 -type d -path "*/$SNAPSHOTS_DIR/$SNAP_ID/snapshot" 2>/dev/null)
+
+    (( ${#matches[@]} > 0 )) \
+        || die "Snapshot #$SNAP_ID not found under any '$SNAPSHOTS_DIR' in the top-level."
+
+    # Keep only matches whose target matches the config's mountpoint
+    local candidate target
+    for candidate in "${matches[@]}"; do
+        target="${candidate%%/$SNAPSHOTS_DIR/*}"
+        if target_matches_config "$target"; then
+            SNAP_REL="$candidate"
+            TARGET_NAME="$target"
+            return 0
+        fi
+    done
+
+    die "Snapshot #$SNAP_ID exists (${matches[*]}) but none belongs to config '$CONFIG'."
+}
+
+# Decide whether a top-level subvolume belongs to the config's mountpoint.
+# The live mount is the primary source, fstab is only a fallback
+# for the ambiguous case where that tells us nothing.
+target_matches_config() {
+    local target="$1" live_root fstab_subvol
+
+    live_root="$(findmnt -n -o FSROOT --target "$MOUNTPOINT" 2>/dev/null || true)"
+    live_root="${live_root#/}"
+
+    # 1. Mounted from the target itself (normal boot): "root" == "root"
+    [[ -n "$live_root" && "$live_root" == "$target" ]] && return 0
+
+    # 2. Booted from a snapshot: "root/.snapshots/<ID>/snapshot" -> target "root"
+    if [[ "$live_root" == */$SNAPSHOTS_DIR/*/snapshot ]]; then
+        [[ "${live_root%%/$SNAPSHOTS_DIR/*}" == "$target" ]] && return 0
+        return 1
+    fi
+
+    # 3. Last resort: what fstab declares for this mountpoint
+    fstab_subvol="$(findmnt --fstab -n -o OPTIONS --mountpoint "$MOUNTPOINT" 2>/dev/null \
+        | tr ',' '\n' | sed -n 's/^subvol=//p' | head -n1 || true)"
+    fstab_subvol="${fstab_subvol#/}"
+    [[ -n "$fstab_subvol" && "$fstab_subvol" == "$target" ]] && return 0
+
+    return 1
+}
+
+# List the DIRECT child subvolumes of TARGET_NAME (e.g. "root/.snapshots").
+# Only direct children are needed: moving one also moves everything nested in it.
+# Output paths are relative to the top-level.
+list_children() {
+    local target_id
+
+    # The subvolume ID of the target, read from `btrfs subvolume show`
+    target_id="$(btrfs subvolume show "$TOP_MNT/$TARGET_NAME" \
+        | awk -F':' '/Subvolume ID/ { gsub(/[ \t]/, "", $2); print $2 }')"
+    [[ -n "$target_id" ]] || die "Could not read the subvolume ID of '$TARGET_NAME'."
+
+    # `list -o` prints: ID n gen n top level <parent-id> path <path>
+    # Keep entries whose parent ("top level") is the target itself.
+    btrfs subvolume list -o "$TOP_MNT/$TARGET_NAME" | awk -v tid="$target_id" '
+        $1 == "ID" && $7 == tid {
+            sub(/^ID [0-9]+ gen [0-9]+ top level [0-9]+ path /, "")
+            print
+        }'
+}
+
+# ---------------------------------------------------------------------------
+# Actions
+# ---------------------------------------------------------------------------
+
+mount_top_level() {
+    info "Mounting btrfs top-level (subvolid=5) on $TOP_MNT"
+    mkdir -p "$TOP_MNT"
+    mount -t btrfs -o subvolid=5 "/dev/disk/by-uuid/$TARGET_UUID" "$TOP_MNT"
+    TOP_MOUNTED=1
+}
+
+confirm() {
+    (( ASSUME_YES )) && return 0
+    (( DRY_RUN )) && return 0
+    local answer
+    read -r -p "Proceed with the rollback? [y/N] " answer
+    [[ "$answer" =~ ^[Yy]$ ]] || { info "Aborted by user."; exit 0; }
+}
+
+# Replace the target subvolume with a writable snapshot of the chosen snapshot
+swap_subvolume() {
+    BACKUP_NAME="${TARGET_NAME}_backup_${TIMESTAMP}"
+
+    # The source lives inside the target, so after renaming the target the
+    # source path must follow it.
+    local source_rel="$SNAP_REL"
+    if [[ "$SNAP_REL" == "$TARGET_NAME/"* ]]; then
+        source_rel="${BACKUP_NAME}/${SNAP_REL#"$TARGET_NAME"/}"
+    fi
+
+    info "Renaming '$TARGET_NAME' -> '$BACKUP_NAME'"
+    run mv "$TOP_MNT/$TARGET_NAME" "$TOP_MNT/$BACKUP_NAME"
+    RENAMED=1
+
+    # No -r flag: the new subvolume is created read-write
+    info "Creating writable snapshot '$TARGET_NAME' from '$source_rel'"
+    run btrfs subvolume snapshot "$TOP_MNT/$source_rel" "$TOP_MNT/$TARGET_NAME"
+    SNAPSHOT_MADE=1
+}
+
+# Move each child subvolume (e.g. .snapshots) from the backup to the new target
+migrate_children() {
+    (( ${#CHILDREN[@]} > 0 )) || return 0
+
+    local child rel_in_target
+    for child in "${CHILDREN[@]}"; do
+        # "root/.snapshots" -> ".snapshots"
+        rel_in_target="${child#"$TARGET_NAME"/}"
+        info "Migrating child subvolume '$rel_in_target'"
+
+        # The new snapshot leaves an empty directory where the child used to be
+        # (btrfs snapshots do not copy nested subvolumes). Remove it first.
+        if [[ -d "$TOP_MNT/$child" ]] && ! btrfs subvolume show "$TOP_MNT/$child" >/dev/null 2>&1; then
+            run rmdir "$TOP_MNT/$child"
+        fi
+
+        run mv "$TOP_MNT/$BACKUP_NAME/$rel_in_target" "$TOP_MNT/$child" \
+            || die "Migration of '$rel_in_target' failed."
+        MIGRATED+=("$child")   # Recorded so on_error can move it back if a LATER child fails
+    done
+}
+
+# Sanity checks on the result: writable, and default subvolume untouched
+verify_result() {
+    (( DRY_RUN )) && return 0
+
+    [[ -d "$TOP_MNT/$TARGET_NAME" ]] || die "New subvolume '$TARGET_NAME' is missing."
+
+    local ro
+    ro="$(btrfs property get -ts "$TOP_MNT/$TARGET_NAME" ro | awk -F= '{print $2}')"
+    [[ "$ro" == "false" ]] || die "New subvolume '$TARGET_NAME' is read-only (expected read-write)."
+
+    local default_id
+    default_id="$(btrfs subvolume get-default "$TOP_MNT" | awk '{print $2}')"
+    [[ "$default_id" == "5" ]] \
+        || warn "Default subvolume is ID $default_id (expected 5). This script did not change it."
+
+    info "Verified: '$TARGET_NAME' is read-write and the default subvolume is untouched."
+}
+
+# ---------------------------------------------------------------------------
+# Backup management (list / clean)
+# ---------------------------------------------------------------------------
+
+# Subvolume ID that the kernel actually mounted for a mountpoint.
+# The ID follows a subvolume through renames, unlike its path, so it still
+# identifies the running system right after a rollback renamed it.
+running_subvol_id() {
+    findmnt -n -o OPTIONS --target "$1" 2>/dev/null \
+        | tr ',' '\n' | sed -n 's/^subvolid=//p' | head -n1
+}
+
+# Fill BACKUPS / BACKUP_IDS with every top-level subvolume named like a backup
+# created by this script. Uses only top-level entries.
+discover_backups() {
+    BACKUPS=()
+    BACKUP_IDS=()
+
+    local id name
+    while read -r id name; do
+        [[ "$name" =~ $BACKUP_RE ]] || continue
+        BACKUPS+=("$name")
+        BACKUP_IDS+=("$id")
+    done < <(btrfs subvolume list "$TOP_MNT" \
+        | awk '$1 == "ID" && $7 == 5 { print $2, $9 }')
+}
+
+# A backup is in use when the running system is mounted from it
+backup_in_use() {
+    local backup_id="$1" running
+    running="$(running_subvol_id /)"
+    [[ -n "$running" && "$running" == "$backup_id" ]]
+}
+
+# Print the numbered list of backups, marking the one currently in use
+print_backups() {
+    local i
+    for i in "${!BACKUPS[@]}"; do
+        printf '  %2d) %s' "$((i + 1))" "${BACKUPS[$i]}"
+        backup_in_use "${BACKUP_IDS[$i]}" && printf '   [in use]'
+        printf '\n'
+    done
+}
+
+# Turn the user's tokens (numbers, ranges "2-4", "all") into unique 0-based indexes.
+# Prints one index per line; returns 1 on an invalid token.
+resolve_selection() {
+    local count="${#BACKUPS[@]}" tok a b
+    local -a picked=()
+
+    for tok in "$@"; do
+        if [[ "$tok" == "all" ]]; then
+            seq 0 $((count - 1)); return 0
+        elif [[ "$tok" =~ ^[0-9]+$ ]]; then
+            (( tok >= 1 && tok <= count )) || { warn "Out of range: $tok"; return 1; }
+            picked+=("$((tok - 1))")
+        elif [[ "$tok" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            a="${BASH_REMATCH[1]}"; b="${BASH_REMATCH[2]}"
+            (( a >= 1 && a <= b && b <= count )) || { warn "Invalid range: $tok"; return 1; }
+            picked+=($(seq "$((a - 1))" "$((b - 1))"))
+        else
+            warn "Not a number, range or 'all': $tok"; return 1
+        fi
+    done
+
+    printf '%s\n' "${picked[@]}" | sort -un
+}
+
+# `list` subcommand
+cmd_list() {
+    discover_backups
+    if (( ${#BACKUPS[@]} == 0 )); then
+        info "No backups found."
+        return 0
+    fi
+    info "Backups found (${#BACKUPS[@]}):"
+    print_backups
+}
+
+# `clean` subcommand
+cmd_clean() {
+    discover_backups
+    if (( ${#BACKUPS[@]} == 0 )); then
+        info "No backups found."
+        return 0
+    fi
+
+    info "Backups found (${#BACKUPS[@]}):"
+    print_backups
+
+    # No selection on the command line: ask for one
+    if (( ${#SELECTION[@]} == 0 )); then
+        local answer
+        read -r -p "Delete which? (numbers, ranges like 2-4, 'all', or Enter to cancel): " answer
+        [[ -n "$answer" ]] || { info "Nothing deleted."; return 0; }
+        read -ra SELECTION <<<"$answer"
+    fi
+
+    local -a indexes
+    mapfile -t indexes < <(resolve_selection "${SELECTION[@]}") \
+        || die "Invalid selection."
+    (( ${#indexes[@]} > 0 )) || die "Invalid selection."
+
+    # Drop the backup in use (btrfs would refuse it anyway) and report it
+    local -a to_delete=()
+    local i
+    for i in "${indexes[@]}"; do
+        if backup_in_use "${BACKUP_IDS[$i]}"; then
+            warn "Skipping '${BACKUPS[$i]}': it is the running system."
+        else
+            to_delete+=("$i")
+        fi
+    done
+    (( ${#to_delete[@]} > 0 )) || { info "Nothing to delete."; return 0; }
+
+    info "About to delete:"
+    for i in "${to_delete[@]}"; do printf '   %s\n' "${BACKUPS[$i]}"; done
+
+    if (( ! ASSUME_YES && ! DRY_RUN )); then
+        local confirm_answer
+        read -r -p "This cannot be undone. Continue? [y/N] " confirm_answer
+        [[ "$confirm_answer" =~ ^[Yy]$ ]] || { info "Aborted by user."; return 0; }
+    fi
+
+    for i in "${to_delete[@]}"; do
+        info "Deleting '${BACKUPS[$i]}'"
+        run btrfs subvolume delete --recursive "$TOP_MNT/${BACKUPS[$i]}"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+# Rollback flow: replace a subvolume with a snapshot of it
+do_rollback() {
+    MOUNTPOINT="$(get_config_mountpoint)"
+    [[ -n "$MOUNTPOINT" ]] || die "Could not read SUBVOLUME from snapper config '$CONFIG'."
+
+    resolve_device "$MOUNTPOINT"
+    mount_top_level
+
+    find_snapshot   # Sets SNAP_REL and TARGET_NAME
+
+    [[ "$TARGET_NAME" != "$SNAPSHOTS_DIR" && "$TARGET_NAME" != */* ]] \
+        || die "Refusing to replace '$TARGET_NAME': it is not a top-level subvolume."
+
+    info "Config: $CONFIG | Mountpoint: $MOUNTPOINT | Device: $TARGET_DEV"
+    info "Target subvolume: $TARGET_NAME | Snapshot source: $SNAP_REL"
+
+    # Record children BEFORE renaming anything (they move with the rename)
+    mapfile -t CHILDREN < <(list_children)
+    if (( ${#CHILDREN[@]} > 0 )); then
+        info "Child subvolumes to migrate: ${CHILDREN[*]}"
+    fi
+
+    warn "Changes made after snapshot #$SNAP_ID will be lost after rebooting."
+    confirm
+
+    swap_subvolume
+    migrate_children
+    verify_result
+
+    info "Done. The previous system is kept as '$BACKUP_NAME'."
+    info "Reboot to boot into the restored '$TARGET_NAME'."
+    info "Once you confirm the restored system is good, remove the backup with:  sudo $SCRIPT_NAME clean"
+    info "If anything goes wrong after rebooting, restore the previous system, by booting a USB and then run:"
+    printf '   sudo mount -t btrfs -o subvolid=5 /dev/disk/by-uuid/%s /mnt \\\n' "$TARGET_UUID"
+    printf '     && sudo mv /mnt/%s /mnt/%s_failed \\\n' "$TARGET_NAME" "$TARGET_NAME"
+    printf '     && sudo mv /mnt/%s /mnt/%s \\\n' "$BACKUP_NAME" "$TARGET_NAME"
+    printf '     && sudo umount /mnt\n'
+}
+
+# list / clean flow: work on the filesystem that holds "/"
+do_backups() {
+    MOUNTPOINT="/"
+    resolve_device "$MOUNTPOINT"
+    mount_top_level
+
+    case "$MODE" in
+        list)  cmd_list ;;
+        clean) cmd_clean ;;
+    esac
+}
+
+main() {
+    parse_args "$@"
+    check_requirements
+
+    case "$MODE" in
+        rollback)     do_rollback ;;
+        list | clean) do_backups ;;
+    esac
+}
+
+main "$@"

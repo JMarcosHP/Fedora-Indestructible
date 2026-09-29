@@ -1,0 +1,32 @@
+# snapper.actions
+# --------------------------
+# Snapper + libdnf5 integration (DNF5 transactions)
+#
+# This file defines hooks that:
+# - Flag the transaction as "important" if any resolved package
+#   belongs to a critical subsystem (kernel, drivers, bootloader, etc.)
+# - Create PRE snapshots before the transaction
+# - Capture incoming (direction=in) package details when the
+#   transaction comes from a GUI, to build an accurate "update" vs
+#   "install" description
+# - Create POST snapshots after the transaction completes
+# - Apply the WAL checkpoint fix for consistency with libdnf5
+#
+
+# Evaluate each resolved package against the "important" patterns
+# (runs before the transaction executes; accumulates the result per PID)
+goal_resolved:*:in::/usr/local/bin/snapper-important.sh ${pid} ${pkg.name}
+goal_resolved:*:out::/usr/local/bin/snapper-important.sh ${pid} ${pkg.name}
+
+# Create the PRE snapshot (uses the "important" flag already accumulated at this point)
+pre_transaction::::/usr/local/bin/snapper-pre.sh ${pid}
+
+# Capture GUI package info — incoming packages ONLY (direction=in).
+# Outgoing packages (old versions being replaced, or genuine removals)
+# are intentionally not tallied: in a normal update every upgraded
+# package also produces an outgoing entry, which would double-count
+# the same event and make a bulk update look like a mass removal.
+pre_transaction:*:in::/usr/local/bin/snapper-gui-pkg.sh ${pid} ${pkg.action} ${pkg.name}
+
+# Create the POST snapshot (with WAL fix and the "important" userdata propagated)
+post_transaction::::/usr/local/bin/snapper-post.sh ${pid}
