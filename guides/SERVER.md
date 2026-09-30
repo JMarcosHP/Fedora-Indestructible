@@ -288,20 +288,22 @@ Verify with `lsattr -d /mnt/fedora/var` (should show `C`).
 #### 17. Tune `fstab` with compression and space_cache
 
 ```bash
-sudo bash -c '
-ESP_UUID="'"$ESP_UUID"'"
-SYSTEM_UUID="'"$SYSTEM_UUID"'"
-( head -n 10 /mnt/fedora/root/etc/fstab; cat <<EOF
-UUID=$ESP_UUID                             /boot/efi   vfat   noatime,nodiratime,errors=remount-ro,umask=0077,shortname=winnt     0 1
-UUID=$SYSTEM_UUID  /           btrfs  subvol=root,noatime,nodiratime,space_cache=v2,compress=zstd:3       0 1
-UUID=$SYSTEM_UUID  /home       btrfs  subvol=home,noatime,nodiratime,space_cache=v2,compress=zstd:3       0 1
-UUID=$SYSTEM_UUID  /opt        btrfs  subvol=opt,noatime,nodiratime,space_cache=v2,compress=zstd:3        0 1
-UUID=$SYSTEM_UUID  /srv        btrfs  subvol=srv,noatime,nodiratime,space_cache=v2,compress=zstd:3        0 1
-UUID=$SYSTEM_UUID  /usr/local  btrfs  subvol=usr_local,noatime,nodiratime,space_cache=v2,compress=zstd:3  0 1
-UUID=$SYSTEM_UUID  /var        btrfs  subvol=var,noatime,nodiratime,space_cache=v2                        0 1
+# Preserve header comments (excluding any swap line) and any swap entry
+sudo head -n 10 /mnt/fedora/root/etc/fstab | sudo awk '$1 ~ /^#/ || $3 != "swap"' | sudo tee /mnt/fedora/root/etc/fstab.tmp > /dev/null
+sudo tee -a /mnt/fedora/root/etc/fstab.tmp > /dev/null <<EOF
+UUID=$ESP_UUID                             /boot/efi   vfat   noatime,errors=remount-ro,umask=0077,shortname=winnt                0 1
+UUID=$SYSTEM_UUID  /           btrfs  subvol=root,noatime,space_cache=v2,compress=zstd:3                  0 0
+UUID=$SYSTEM_UUID  /home       btrfs  subvol=home,noatime,space_cache=v2,compress=zstd:3                  0 0
+UUID=$SYSTEM_UUID  /opt        btrfs  subvol=opt,noatime,space_cache=v2,compress=zstd:3                   0 0
+UUID=$SYSTEM_UUID  /srv        btrfs  subvol=srv,noatime,space_cache=v2,compress=zstd:3                   0 0
+UUID=$SYSTEM_UUID  /usr/local  btrfs  subvol=usr_local,noatime,space_cache=v2,compress=zstd:3             0 0
+UUID=$SYSTEM_UUID  /var        btrfs  subvol=var,noatime,space_cache=v2                                   0 0
 EOF
-) > /mnt/fedora/root/etc/fstab.tmp && mv -f /mnt/fedora/root/etc/fstab.tmp /mnt/fedora/root/etc/fstab
-'
+SWAP_ENTRIES="$(sudo awk '$1 !~ /^#/ && $3 == "swap"' /mnt/fedora/root/etc/fstab)"
+if [[ -n "$SWAP_ENTRIES" ]]; then
+    echo "$SWAP_ENTRIES" | sudo awk '{ printf "%-41s  %-10s  %-5s  %-66s  %s %s\n", $1, $2, $3, $4, $5, $6 }' | sudo tee -a /mnt/fedora/root/etc/fstab.tmp > /dev/null
+fi
+sudo mv -f /mnt/fedora/root/etc/fstab.tmp /mnt/fedora/root/etc/fstab
 ```
 
 Then reload and verify:

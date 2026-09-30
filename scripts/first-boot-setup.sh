@@ -83,13 +83,13 @@ SWAP_ENTRIES="$(awk '$1 !~ /^#/ && $3 == "swap"' "$FSTAB_FILE")"
 (
     head -n 10 "$FSTAB_FILE" | awk '$1 ~ /^#/ || $3 != "swap"'
     cat <<EOF
-UUID=$ESP_UUID                             /boot/efi   vfat   noatime,nodiratime,errors=remount-ro,umask=0077,shortname=winnt     0 1
-UUID=$SYSTEM_UUID  /           btrfs  subvol=root,noatime,nodiratime,space_cache=v2,compress=zstd:3       0 1
-UUID=$SYSTEM_UUID  /home       btrfs  subvol=home,noatime,nodiratime,space_cache=v2,compress=zstd:3       0 1
-UUID=$SYSTEM_UUID  /opt        btrfs  subvol=opt,noatime,nodiratime,space_cache=v2,compress=zstd:3        0 1
-UUID=$SYSTEM_UUID  /srv        btrfs  subvol=srv,noatime,nodiratime,space_cache=v2,compress=zstd:3        0 1
-UUID=$SYSTEM_UUID  /usr/local  btrfs  subvol=usr_local,noatime,nodiratime,space_cache=v2,compress=zstd:3  0 1
-UUID=$SYSTEM_UUID  /var        btrfs  subvol=var,noatime,nodiratime,space_cache=v2                        0 1
+UUID=$ESP_UUID                             /boot/efi   vfat   noatime,errors=remount-ro,umask=0077,shortname=winnt                0 1
+UUID=$SYSTEM_UUID  /           btrfs  subvol=root,noatime,space_cache=v2,compress=zstd:3                  0 0
+UUID=$SYSTEM_UUID  /home       btrfs  subvol=home,noatime,space_cache=v2,compress=zstd:3                  0 0
+UUID=$SYSTEM_UUID  /opt        btrfs  subvol=opt,noatime,space_cache=v2,compress=zstd:3                   0 0
+UUID=$SYSTEM_UUID  /srv        btrfs  subvol=srv,noatime,space_cache=v2,compress=zstd:3                   0 0
+UUID=$SYSTEM_UUID  /usr/local  btrfs  subvol=usr_local,noatime,space_cache=v2,compress=zstd:3             0 0
+UUID=$SYSTEM_UUID  /var        btrfs  subvol=var,noatime,space_cache=v2                                   0 0
 EOF
     if [[ -n "$SWAP_ENTRIES" ]]; then
         # Realign to the same columns as the injected entries above.
